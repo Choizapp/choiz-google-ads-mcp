@@ -57,6 +57,3 @@ uv.lock
 
 # Claude Code internal
 .claude/
-
-# Local scripts with hardcoded credentials
-setup_oauth.py

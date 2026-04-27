@@ -49,16 +49,36 @@ def format_customer_id(customer_id: str) -> str:
     return ''.join(c for c in customer_id if c.isdigit())
 
 
-def get_ads_client(customer_id: str = None) -> GoogleAdsClient:
+def _load_oauth_creds() -> dict:
+    """Load OAuth credentials.
+
+    Production (containerized): read from GOOGLE_ADS_OAUTH_CLIENT_ID /
+    GOOGLE_ADS_OAUTH_CLIENT_SECRET / GOOGLE_ADS_OAUTH_REFRESH_TOKEN env vars.
+    Local dev: fall back to the credentials.json file at GOOGLE_ADS_CREDENTIALS_PATH.
+    """
+    cid = os.environ.get("GOOGLE_ADS_OAUTH_CLIENT_ID")
+    csec = os.environ.get("GOOGLE_ADS_OAUTH_CLIENT_SECRET")
+    crt = os.environ.get("GOOGLE_ADS_OAUTH_REFRESH_TOKEN")
+    if cid and csec and crt:
+        return {"client_id": cid, "client_secret": csec, "refresh_token": crt}
+
     if not GOOGLE_ADS_CREDENTIALS_PATH:
-        raise ValueError("GOOGLE_ADS_CREDENTIALS_PATH environment variable not set")
+        raise ValueError(
+            "Provide OAuth credentials via either GOOGLE_ADS_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN "
+            "env vars (preferred) or GOOGLE_ADS_CREDENTIALS_PATH pointing to a credentials.json file."
+        )
     if not os.path.exists(GOOGLE_ADS_CREDENTIALS_PATH):
         raise FileNotFoundError(f"credentials.json not found at {GOOGLE_ADS_CREDENTIALS_PATH}. Run setup_oauth.py first.")
+
+    with open(GOOGLE_ADS_CREDENTIALS_PATH) as f:
+        return json.load(f)
+
+
+def get_ads_client(customer_id: str = None) -> GoogleAdsClient:
     if not GOOGLE_ADS_DEVELOPER_TOKEN:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set")
 
-    with open(GOOGLE_ADS_CREDENTIALS_PATH) as f:
-        creds = json.load(f)
+    creds = _load_oauth_creds()
 
     config = {
         "client_id":       creds["client_id"],
@@ -167,7 +187,7 @@ async def run_gaql(
         dicts = [proto_to_dict(r) for r in rows]
 
         if fmt.lower() == "json":
-            return json.dumps(dicts, indent=2, ensure_ascii=False)
+            return json.dumps(dicts, ensure_ascii=False)
 
         flat_rows = [flatten_dict(d) for d in dicts]
         # Drop rows that are completely empty (shouldn't happen after proto fix, but defensive)
@@ -231,7 +251,7 @@ async def get_campaign_performance(
         FROM campaign
         WHERE segments.date DURING LAST_{days}_DAYS
         ORDER BY metrics.cost_micros DESC
-        LIMIT 50
+        LIMIT 25
     """
     return await run_gaql(customer_id, query, "table")
 
@@ -249,7 +269,7 @@ async def get_ad_performance(
         FROM ad_group_ad
         WHERE segments.date DURING LAST_{days}_DAYS
         ORDER BY metrics.impressions DESC
-        LIMIT 50
+        LIMIT 25
     """
     return await run_gaql(customer_id, query, "table")
 
@@ -285,7 +305,7 @@ async def get_ad_creatives(
         FROM ad_group_ad
         WHERE ad_group_ad.status != 'REMOVED'
         ORDER BY campaign.name, ad_group.name
-        LIMIT 50
+        LIMIT 25
     """
     try:
         rows = run_query(customer_id, query)
@@ -322,7 +342,7 @@ async def get_ad_creatives(
 @mcp.tool()
 async def get_image_assets(
     customer_id: str = Field(description="Google Ads customer ID (digits only). Example: '5916996729'"),
-    limit: int = Field(default=50, description="Maximum number of image assets to return")
+    limit: int = Field(default=25, description="Maximum number of image assets to return")
 ) -> str:
     """Retrieve image assets in the account including their full-size URLs."""
     query = f"""
@@ -374,6 +394,7 @@ async def list_resources(
         FROM google_ads_field
         WHERE google_ads_field.category = 'RESOURCE'
         ORDER BY google_ads_field.name
+        LIMIT 200
     """
     return await run_gaql(customer_id, query, "table")
 
@@ -392,7 +413,7 @@ async def get_asset_usage(
         SELECT campaign.id, campaign.name, asset.id, asset.name, asset.type
         FROM campaign_asset
         WHERE {where}
-        LIMIT 500
+        LIMIT 50
     """
     return await run_gaql(customer_id, query, "table")
 
@@ -413,7 +434,7 @@ async def analyze_image_assets(
         FROM campaign_asset
         WHERE asset.type = 'IMAGE' AND segments.date DURING LAST_30_DAYS
         ORDER BY metrics.impressions DESC
-        LIMIT 200
+        LIMIT 50
     """
     try:
         rows = run_query(customer_id, query)

@@ -1,15 +1,14 @@
-# MCP requirements
-mcp>=0.0.11
+# MCP runtime — `mcp[cli]` provides the `mcp run` launcher used in containers.
+mcp[cli]>=1.3.0
 
-# Google API requirements
-google-auth>=2.25.2
-google-auth-oauthlib>=1.1.0
-google-auth-httplib2>=0.1.1
+# Google Ads API — gRPC client (the codebase migrated off REST in 9d27ca9).
+google-ads>=29.2.0
+
+# OAuth helper used only by setup_oauth.py to mint refresh tokens.
+google-auth-oauthlib>=1.2.1
+
+# HTTP client used by download_image_asset.
 requests>=2.31.0
 
-# Environment configuration
+# Optional .env loader (skipped silently if not present).
 python-dotenv>=1.0.0
-
-# Optional visualization dependencies
-matplotlib>=3.7.3
-pandas>=2.1.4
