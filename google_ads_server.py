@@ -74,7 +74,27 @@ def _load_oauth_creds() -> dict:
         return json.load(f)
 
 
+# Module-level cache for the GoogleAdsClient. Constructing one is expensive
+# (it opens gRPC channels to googleads.googleapis.com and pulls a large
+# protobuf descriptor pool into memory). Re-creating per tool call leaks
+# ~50–90 MB of resident memory per call under the supergateway+FastMCP
+# stateless pattern, which on the gateway eventually trips the cgroup
+# mem_limit and forces a child-process restart. Caching keeps a single
+# client + channel for the life of the process.
+#
+# Safe because GOOGLE_ADS_LOGIN_CUSTOMER_ID is configured once at startup
+# and login_customer_id is a property of the *client*, while the per-request
+# customer_id is passed to GoogleAdsService.search() separately. If a use
+# case ever needs different login_customer_ids in the same process, switch
+# to a dict cache keyed on login_id.
+_ADS_CLIENT: Optional[GoogleAdsClient] = None
+
+
 def get_ads_client(customer_id: str = None) -> GoogleAdsClient:
+    global _ADS_CLIENT
+    if _ADS_CLIENT is not None:
+        return _ADS_CLIENT
+
     if not GOOGLE_ADS_DEVELOPER_TOKEN:
         raise ValueError("GOOGLE_ADS_DEVELOPER_TOKEN environment variable not set")
 
@@ -92,7 +112,8 @@ def get_ads_client(customer_id: str = None) -> GoogleAdsClient:
     if login_id:
         config["login_customer_id"] = format_customer_id(login_id)
 
-    return GoogleAdsClient.load_from_dict(config)
+    _ADS_CLIENT = GoogleAdsClient.load_from_dict(config)
+    return _ADS_CLIENT
 
 
 def run_query(customer_id: str, query: str) -> list:
@@ -160,7 +181,7 @@ async def list_accounts() -> str:
 async def run_gaql(
     customer_id: str = Field(description="Google Ads customer ID (digits only). Example: '5916996729'"),
     query: str = Field(description="Valid GAQL query string"),
-    format: str = Field(default="table", description="Output format: 'table', 'json', or 'csv'")
+    format: str = Field(default="csv", description="Output format: 'csv' (default, compact), 'json', or 'table' (padded ASCII — verbose, use sparingly)")
 ) -> str:
     """
     Execute any GAQL (Google Ads Query Language) query with custom formatting.
@@ -176,8 +197,11 @@ async def run_gaql(
 
     Note: Cost values are in micros (1,000,000 = 1 unit of currency).
     """
-    # Normalize format — Field default comes through as a FieldInfo object when called internally
-    fmt = format if isinstance(format, str) else "table"
+    # Default 'csv' (and not 'table') because the ASCII-padded table inflates
+    # rows ~30x with whitespace; combined with the claude.ai ~2-3 KB tool-result
+    # ceiling, 'table' on multi-row results hits the wall. Caller can still
+    # request 'table' explicitly.
+    fmt = format if isinstance(format, str) else "csv"
     try:
         rows = run_query(customer_id, query)
         cid = format_customer_id(customer_id)
@@ -241,7 +265,8 @@ async def execute_gaql_query(
 @mcp.tool()
 async def get_campaign_performance(
     customer_id: str = Field(description="Google Ads customer ID (digits only). Example: '5916996729'"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 90, etc.)")
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 90, etc.)"),
+    limit: int = Field(default=10, description="Max campaigns to return. Default 10 keeps output under the ~2-3 KB claude.ai payload ceiling; raise carefully.")
 ) -> str:
     """Get campaign performance metrics. Cost values are in micros (1,000,000 = 1 unit of currency)."""
     query = f"""
@@ -251,15 +276,16 @@ async def get_campaign_performance(
         FROM campaign
         WHERE segments.date DURING LAST_{days}_DAYS
         ORDER BY metrics.cost_micros DESC
-        LIMIT 25
+        LIMIT {int(limit)}
     """
-    return await run_gaql(customer_id, query, "table")
+    return await run_gaql(customer_id, query, "csv")
 
 
 @mcp.tool()
 async def get_ad_performance(
     customer_id: str = Field(description="Google Ads customer ID (digits only). Example: '5916996729'"),
-    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 90, etc.)")
+    days: int = Field(default=30, description="Number of days to look back (7, 14, 30, 90, etc.)"),
+    limit: int = Field(default=10, description="Max ads to return. Default 10 keeps output under the ~2-3 KB claude.ai payload ceiling.")
 ) -> str:
     """Get ad-level performance metrics. Cost values are in micros (1,000,000 = 1 unit of currency)."""
     query = f"""
@@ -269,9 +295,9 @@ async def get_ad_performance(
         FROM ad_group_ad
         WHERE segments.date DURING LAST_{days}_DAYS
         ORDER BY metrics.impressions DESC
-        LIMIT 25
+        LIMIT {int(limit)}
     """
-    return await run_gaql(customer_id, query, "table")
+    return await run_gaql(customer_id, query, "csv")
 
 
 @mcp.tool()
@@ -396,7 +422,7 @@ async def list_resources(
         ORDER BY google_ads_field.name
         LIMIT 200
     """
-    return await run_gaql(customer_id, query, "table")
+    return await run_gaql(customer_id, query, "csv")
 
 
 @mcp.tool()
@@ -415,7 +441,7 @@ async def get_asset_usage(
         WHERE {where}
         LIMIT 50
     """
-    return await run_gaql(customer_id, query, "table")
+    return await run_gaql(customer_id, query, "csv")
 
 
 @mcp.tool()
@@ -567,7 +593,7 @@ Recommended workflow:
 1. list_accounts() — find available account IDs
 2. get_account_currency(customer_id="...") — check currency
 3. get_campaign_performance(customer_id="...", days=30) — overview
-4. run_gaql(customer_id="...", query="...", format="table") — custom queries
+4. run_gaql(customer_id="...", query="...") — custom queries (default csv)
 
 Always pass customer_id as digits only: e.g. "5916996729"
 """
@@ -586,7 +612,7 @@ Keyword performance:
   SELECT keyword_view.resource_name, metrics.impressions, metrics.clicks
   FROM keyword_view WHERE segments.date DURING LAST_30_DAYS
 
-Use with: run_gaql(customer_id="5916996729", query="...", format="table")
+Use with: run_gaql(customer_id="5916996729", query="...")  # default format='csv'
 """
 
 
