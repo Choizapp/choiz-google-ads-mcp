@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional, Union
 from pydantic import Field
 import os
+import re
 import json
 import requests
 from datetime import datetime, timedelta
@@ -157,6 +158,24 @@ def flatten_dict(d, parent=""):
     return items
 
 
+# Extract the field paths from a GAQL SELECT clause so we can trim the
+# output to exactly what the user asked for. Without this, proto_to_dict +
+# including_default_value_fields=True dumps every field of the (huge) proto
+# schema, and a single campaign row blows past the claude.ai 2-3 KB tool-
+# result ceiling. We keep including_default_value_fields=True (so zeros in
+# requested metrics still appear) and filter post-hoc by SELECTed keys.
+#
+# Best-effort parser — handles standard GAQL `SELECT a.b, c.d FROM ...`
+# shape. Aliases (`AS x`) or computed expressions are not stripped; if a
+# query uses them, we just fall back to the un-filtered key set, which is
+# the prior behavior.
+def parse_select_fields(query: str) -> list:
+    m = re.search(r"\bSELECT\b\s*(.+?)\s*\bFROM\b", query, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    return [f.strip() for f in m.group(1).split(",") if f.strip()]
+
+
 @mcp.tool()
 async def list_accounts() -> str:
     """
@@ -210,16 +229,30 @@ async def run_gaql(
 
         dicts = [proto_to_dict(r) for r in rows]
 
+        # Trim each row to the fields the SELECT clause asked for. proto_to_dict
+        # with including_default_value_fields=True returns the *entire* proto
+        # schema (~80 fields per campaign), and a single row plus the ASCII
+        # padding made the prior 'table' default reach 70 KB. Filtering here
+        # also cleans up 'csv' output for callers using compact formats.
+        # If the SELECT can't be parsed, fall back to the un-filtered key set
+        # (prior behavior).
+        selected = parse_select_fields(query)
+
         if fmt.lower() == "json":
+            if selected:
+                trimmed = [{k: v for k, v in flatten_dict(d).items() if k in selected} for d in dicts]
+                return json.dumps(trimmed, ensure_ascii=False)
             return json.dumps(dicts, ensure_ascii=False)
 
         flat_rows = [flatten_dict(d) for d in dicts]
+        if selected:
+            flat_rows = [{k: r.get(k, "") for k in selected} for r in flat_rows]
         # Drop rows that are completely empty (shouldn't happen after proto fix, but defensive)
         flat_rows = [r for r in flat_rows if r]
         if not flat_rows:
             return f"Query returned {len(rows)} rows but all fields were empty. Try format='json' for raw output."
 
-        all_keys = list(dict.fromkeys(k for r in flat_rows for k in r))
+        all_keys = selected if selected else list(dict.fromkeys(k for r in flat_rows for k in r))
 
         if fmt.lower() == "csv":
             lines = [",".join(all_keys)]
